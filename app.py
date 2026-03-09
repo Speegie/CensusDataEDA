@@ -10,11 +10,12 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 # Allow running from repo root without installing the package
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from census_insurance.fetcher import fetch_tracts
+from census_insurance.fetcher import fetch_state_overview, fetch_tracts
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -44,17 +45,23 @@ STATES = {
     "54": "West Virginia", "55": "Wisconsin", "56": "Wyoming",
 }
 
-# Common counties for quick demo — user can type a FIPS code directly
-DEMO_COUNTIES = {
-    "031": "Cook County, IL",
-    "043": "DuPage County, IL",
-    "089": "Kane County, IL",
-    "111": "McHenry County, IL",
-    "197": "Will County, IL",
-    "113": "Los Angeles County, CA (large pull — slow)",
-    "061": "New York County, NY",
-    "201": "Harris County, TX",
-}
+@st.cache_data(show_spinner="Loading counties…")
+def fetch_counties(state_fips: str) -> dict[str, str]:
+    """Return {county_fips: county_name} for all counties in a state."""
+    params = {
+        "get": "NAME",
+        "for": "county:*",
+        "in": f"state:{state_fips}",
+    }
+    resp = requests.get(
+        "https://api.census.gov/data/2024/acs/acs5",
+        params=params,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    # payload[0] = ['NAME', 'state', 'county'], payload[1:] = data rows
+    return {row[2]: row[0] for row in payload[1:]}
 
 # ---------------------------------------------------------------------------
 # Metric metadata — used for labels, tooltips, and explanations
@@ -175,9 +182,14 @@ QUADRANT_COLORS = {
 # Data loading
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Fetching data from Census API…")
+@st.cache_data(show_spinner="Fetching tract data from Census API…")
 def load_live(state: str, county: str, year: int) -> pd.DataFrame:
     return fetch_tracts(state, county, year)
+
+
+@st.cache_data(show_spinner="Fetching county overview from Census API…")
+def load_state_overview(state: str, year: int) -> pd.DataFrame:
+    return fetch_state_overview(state, year)
 
 
 def load_csv(uploaded) -> pd.DataFrame:
@@ -205,24 +217,30 @@ if data_source == "Live — Census API":
         format_func=lambda k: f"{STATES[k]} ({k})",
         index=list(STATES.keys()).index("17"),
     )
+    counties = fetch_counties(state_label)
+    county_options = sorted(counties.keys(), key=lambda k: counties[k])
     county_input = st.sidebar.selectbox(
-        "County (FIPS)",
-        options=list(DEMO_COUNTIES.keys()),
-        format_func=lambda k: DEMO_COUNTIES[k],
-        index=0,
+        "County",
+        options=county_options,
+        format_func=lambda k: counties[k],
     )
-    custom_county = st.sidebar.text_input(
-        "Or enter a custom 3-digit county FIPS code",
-        placeholder="e.g. 031",
-    )
-    county_fips = custom_county.strip().zfill(3) if custom_county.strip() else county_input
+    county_fips = county_input
     year = st.sidebar.selectbox("ACS Year", [2024, 2023, 2022, 2021, 2020], index=0)
 
-    if st.sidebar.button("Fetch Data", type="primary"):
+    col_btn1, col_btn2 = st.sidebar.columns(2)
+    if col_btn1.button("State Overview", use_container_width=True):
+        state_df = load_state_overview(state_label, year)
+        st.session_state["state_df"] = state_df
+        st.session_state["state_fips"] = state_label
+        st.session_state["overview_year"] = year
+        # Clear any previous tract-level data so the overview tab is shown first
+        st.session_state.pop("df", None)
+
+    if col_btn2.button("County Detail", type="primary", use_container_width=True):
         df = load_live(state_label, county_fips, year)
         st.session_state["df"] = df
         st.session_state["source_label"] = (
-            f"{STATES[state_label]} — County {county_fips} ({year} ACS 5-yr)"
+            f"{STATES[state_label]} — {counties.get(county_fips, county_fips)} ({year} ACS 5-yr)"
         )
 
     if "df" in st.session_state:
@@ -261,10 +279,172 @@ st.sidebar.download_button(
     mime="text/csv",
 )
 
-tab_general, tab_homeowners = st.tabs(["📊 General Overview", "🏠 Homeowners / P&C"])
+tab_state, tab_general, tab_homeowners = st.tabs(
+    ["🗺️ State Overview", "📊 General Overview", "🏠 Homeowners / P&C"]
+)
 
 # ===========================================================================
-# TAB 1 — GENERAL OVERVIEW
+# TAB 1 — STATE OVERVIEW
+# ===========================================================================
+with tab_state:
+    state_df: pd.DataFrame | None = st.session_state.get("state_df")
+
+    if state_df is None:
+        st.header("State Overview")
+        st.info(
+            "👈  Select a state and click **State Overview** to load county-level data "
+            "for all counties in the state."
+        )
+    else:
+        state_fips = st.session_state.get("state_fips", "")
+        state_name = STATES.get(state_fips, state_fips)
+        overview_year = st.session_state.get("overview_year", 2024)
+
+        st.header(f"State Overview — {state_name} ({overview_year} ACS 5-yr)")
+        st.markdown(
+            f"All **{len(state_df)}** counties in {state_name}, scored using the same "
+            "methodology as the tract-level views. Use this to identify which counties "
+            "to drill into, then click **County Detail** in the sidebar."
+        )
+
+        # --- KPI cards ---
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Counties", len(state_df))
+        c2.metric("Avg Opportunity", f"{state_df['opportunity_score'].mean():.2f}")
+        c3.metric("Avg Risk", f"{state_df['risk_score'].mean():.2f}")
+        c4.metric(
+            "Median HH Income",
+            f"${state_df['median_household_income'].median():,.0f}",
+        )
+        c5.metric(
+            "Avg Homeownership",
+            f"{state_df['homeownership_rate'].mean():.1%}",
+        )
+
+        st.markdown("---")
+
+        # --- Sortable county table ---
+        st.subheader("County Rankings")
+
+        sort_col = st.selectbox(
+            "Sort by",
+            ["opportunity_score", "risk_score", "homeowners_opportunity",
+             "homeowners_risk", "median_household_income", "median_home_value",
+             "homeownership_rate", "poverty_rate"],
+            format_func=lambda k: METRIC_META.get(k, {}).get("label", k),
+            key="state_sort_col",
+        )
+        sort_asc = st.checkbox("Sort ascending", value=False, key="state_sort_asc")
+
+        table_cols = [
+            "county_name", "county", "opportunity_score", "risk_score",
+            "homeowners_opportunity", "homeowners_risk",
+            "median_household_income", "median_home_value",
+            "homeownership_rate", "poverty_rate", "old_housing_share",
+        ]
+        available_table_cols = [c for c in table_cols if c in state_df.columns]
+        display_df = (
+            state_df[available_table_cols]
+            .sort_values(sort_col, ascending=sort_asc)
+            .reset_index(drop=True)
+        )
+        display_df.index += 1  # 1-based rank
+
+        state_fmt = {
+            "opportunity_score": "{:.3f}",
+            "risk_score": "{:.3f}",
+            "homeowners_opportunity": "{:.3f}",
+            "homeowners_risk": "{:.3f}",
+            "median_household_income": "${:,.0f}",
+            "median_home_value": "${:,.0f}",
+            "homeownership_rate": "{:.1%}",
+            "poverty_rate": "{:.1%}",
+            "old_housing_share": "{:.1%}",
+        }
+        st.dataframe(
+            display_df.style.format(
+                {k: v for k, v in state_fmt.items() if k in display_df.columns}
+            ),
+            use_container_width=True,
+            height=480,
+        )
+
+        st.markdown("---")
+
+        # --- Bar chart ---
+        st.subheader("Top Counties by Score")
+
+        bar_metric = st.selectbox(
+            "Metric to chart",
+            ["opportunity_score", "risk_score", "homeowners_opportunity",
+             "homeowners_risk", "median_household_income", "homeownership_rate"],
+            format_func=lambda k: METRIC_META.get(k, {}).get("label", k),
+            key="state_bar_metric",
+        )
+        top_n_state = st.slider("Counties to show", 5, len(state_df), min(20, len(state_df)), key="state_top_n")
+
+        bar_df = state_df.nlargest(top_n_state, bar_metric)[["county_name", bar_metric]].copy()
+        is_dollar_metric = bar_metric in ("median_household_income", "median_home_value")
+
+        fig_state_bar = px.bar(
+            bar_df,
+            x=bar_metric,
+            y="county_name",
+            orientation="h",
+            title=f"Top {top_n_state} Counties — {METRIC_META.get(bar_metric, {}).get('label', bar_metric)}",
+            labels={
+                bar_metric: METRIC_META.get(bar_metric, {}).get("label", bar_metric),
+                "county_name": "",
+            },
+            color_discrete_sequence=["#3498db"],
+        )
+        if is_dollar_metric:
+            fig_state_bar.update_xaxes(tickformat="$,.0f")
+        fig_state_bar.update_layout(height=max(400, top_n_state * 26), yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig_state_bar, use_container_width=True)
+
+        st.markdown("---")
+
+        # --- Drill-down selector ---
+        st.subheader("Drill Down to Tract Level")
+        st.markdown(
+            "Select a county below, then click **County Detail** in the sidebar "
+            "to load all census tracts for that county in the General Overview and "
+            "Homeowners tabs."
+        )
+
+        county_options_state = sorted(
+            state_df["county"].tolist(),
+            key=lambda k: state_df.loc[state_df["county"] == k, "county_name"].iloc[0],
+        )
+        county_names_map = dict(zip(state_df["county"], state_df["county_name"]))
+
+        drill_county = st.selectbox(
+            "County to explore",
+            options=county_options_state,
+            format_func=lambda k: county_names_map.get(k, k),
+            key="drill_county",
+        )
+
+        # Sync the sidebar county selector to the drilled county
+        if drill_county and drill_county in st.session_state.get("_county_options", [county_options_state]):
+            st.session_state["_drill_county"] = drill_county
+
+        row = state_df[state_df["county"] == drill_county].iloc[0]
+        drill_c1, drill_c2, drill_c3, drill_c4 = st.columns(4)
+        drill_c1.metric("Opportunity Score", f"{row['opportunity_score']:.3f}")
+        drill_c2.metric("Risk Score", f"{row['risk_score']:.3f}")
+        drill_c3.metric("Homeowners Opportunity", f"{row['homeowners_opportunity']:.3f}")
+        drill_c4.metric("Homeowners Risk", f"{row['homeowners_risk']:.3f}")
+
+        st.info(
+            f"**To load tract-level data for {county_names_map.get(drill_county, drill_county)}:** "
+            f"Select this county in the sidebar County dropdown, then click **County Detail**."
+        )
+
+
+# ===========================================================================
+# TAB 2 — GENERAL OVERVIEW  (tract level)
 # ===========================================================================
 with tab_general:
     st.header("General Insurance Market Overview")
