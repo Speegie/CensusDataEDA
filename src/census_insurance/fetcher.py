@@ -204,6 +204,27 @@ def fetch_tracts(
     return _build_features(df)
 
 
+def fetch_national_overview(
+    year: int = 2024,
+    api_key: str | None = None,
+) -> pd.DataFrame:
+    """Fetch ACS 5-year state-level data for all 50 states + DC.
+
+    Returns one row per state with the same derived features and scores
+    as fetch_state_overview, scored relative to other states nationally.
+    """
+    if api_key is None:
+        api_key = os.getenv("CENSUS_API_KEY")
+
+    geo_params = {"for": "state:*"}
+    id_cols = ["NAME", "state"]
+
+    df = _fetch_and_clean(year, geo_params, id_cols, api_key)
+    df["GEOID"] = df["state"]
+    df["state_name"] = df["NAME"].str.strip()
+    return _build_features(df)
+
+
 def fetch_state_overview(
     state: str,
     year: int = 2024,
